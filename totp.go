@@ -8,7 +8,9 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"net/url"
@@ -31,16 +33,39 @@ var digitPow = []int{
 	1000000000,
 }
 
-// TOTP is a configuration for Time-Based One Time Password(RFC 6238)
-type TOTP struct {
-	Algorithm string
-	Digits    int
-	Period    int
-	Secret    []byte
+// Key is a configuration for Time-Based One Time Password(RFC 6238)
+type Key struct {
+	algorithm string
+	digits    int
+	period    int
+	secret    []byte
 }
 
-// Option is a functional option for TOTP constructor.
-type Option func(c *TOTP) error
+type key struct {
+	Algorithm string `json:"a"`
+	Digits    int    `json:"d"`
+	Period    int    `json:"p"`
+	Secret    []byte `json:"s"`
+}
+
+// Encrypter is the interface that wraps the basic Encrypt method
+type Encrypter interface {
+	Encrypt(msg []byte) ([]byte, error)
+}
+
+// Decrypter is the interface that wraps the basic Decrypt method
+type Decrypter interface {
+	Decrypt(msg []byte) ([]byte, error)
+}
+
+// EncDecrypter is the interface that groups the basic Encrypt and Decrypt methods.
+type EncDecrypter interface {
+	Encrypter
+	Decrypter
+}
+
+// Option is a functional option for Key constructor.
+type Option func(k *Key) error
 
 // Algorithm returns a functional option for the TOTP algorithm.
 //
@@ -48,10 +73,10 @@ type Option func(c *TOTP) error
 //
 // The default value is "sha1".
 func Algorithm(alg string) Option {
-	return func(t *TOTP) error {
+	return func(k *Key) error {
 		switch alg {
 		case "sha1", "sha256", "sha512":
-			t.Algorithm = alg
+			k.algorithm = alg
 			return nil
 		default:
 			return fmt.Errorf("hash algorithm [%s] is not supported", alg)
@@ -64,11 +89,11 @@ func Algorithm(alg string) Option {
 //
 // The default value is 6.
 func Digits(digits int) Option {
-	return func(totp *TOTP) error {
+	return func(k *Key) error {
 		if digits <= 0 || digits >= len(digitPow) {
 			return fmt.Errorf("digits [%d] is not supported", digits)
 		}
-		totp.Digits = digits
+		k.digits = digits
 		return nil
 	}
 }
@@ -78,11 +103,11 @@ func Digits(digits int) Option {
 //
 // The default value is 30.
 func Period(period int) Option {
-	return func(totp *TOTP) error {
+	return func(k *Key) error {
 		if period <= 0 {
 			return fmt.Errorf("period [%d] is not positive", period)
 		}
-		totp.Period = period
+		k.period = period
 		return nil
 	}
 }
@@ -91,81 +116,81 @@ func Period(period int) Option {
 //
 // If omitted, it is automatically generated.
 func Secret(secret []byte) Option {
-	return func(totp *TOTP) error {
-		totp.Secret = secret
+	return func(k *Key) error {
+		k.secret = secret
 		return nil
 	}
 }
 
-// New creates a new TOTP configuration
-func New(options ...Option) (*TOTP, error) {
-	totp := &TOTP{
-		Algorithm: "sha1",
-		Digits:    6,
-		Period:    30,
+// NewKey creates a new TOTP key
+func NewKey(options ...Option) (*Key, error) {
+	k := &Key{
+		algorithm: "sha1",
+		digits:    6,
+		period:    30,
 	}
 	for _, apply := range options {
-		err := apply(totp)
+		err := apply(k)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if totp.Secret == nil {
-		secret := make([]byte, hashLength(totp.Algorithm))
+	if k.secret == nil {
+		secret := make([]byte, hashLength(k.algorithm))
 		_, err := rand.Read(secret)
 		if err != nil {
 			return nil, fmt.Errorf("not enough secure random stream: %v", err)
 		}
-		totp.Secret = secret
+		k.secret = secret
 	}
 
-	return totp, nil
+	return k, nil
 }
 
 // GenerateCode generates a TOTP code using the current time.
-func (totp *TOTP) GenerateCode() string {
-	return totp.GenerateCodeAt(time.Now())
+func (k *Key) GenerateCode() string {
+	return k.GenerateCodeAt(time.Now())
 }
 
 // GenerateCodeAt generates a TOTP code using a specified time.
-func (totp *TOTP) GenerateCodeAt(t time.Time) string {
+func (k *Key) GenerateCodeAt(t time.Time) string {
 	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, uint64(t.Unix()/int64(totp.Period)))
-	h := hmac.New(hashFunc(totp.Algorithm), totp.Secret)
+	binary.BigEndian.PutUint64(b, uint64(t.Unix()/int64(k.period)))
+	h := hmac.New(hashFunc(k.algorithm), k.secret)
 	h.Write(b)
 	sum := h.Sum(nil)
 
 	offset := sum[len(sum)-1] & 0xf
 	code := int(binary.BigEndian.Uint32(sum[offset:]) & 0x7FFFFFFF)
-	return truncatedStringCode(code, totp.Digits)
+	return truncatedStringCode(code, k.digits)
 }
 
 // ValidateCode validates a TOTP code using the current time.
-func (totp *TOTP) ValidateCode(code string) bool {
-	return totp.ValidateCodeAt(code, time.Now())
+func (k *Key) ValidateCode(code string) bool {
+	return k.ValidateCodeAt(code, time.Now())
 }
 
 // ValidateCodeAt validates a TOTP code using a specified time.
-func (totp *TOTP) ValidateCodeAt(code string, t time.Time) bool {
-	return totp.GenerateCodeAt(t) == code
+func (k *Key) ValidateCodeAt(code string, t time.Time) bool {
+	return k.GenerateCodeAt(t) == code
 }
 
 // URI returns the OTP URI as a string.
 //
 // See https://github.com/google/google-authenticator/wiki/Key-Uri-Format
-func (totp *TOTP) URI(issuer, account string) string {
+func (k *Key) URI(issuer, account string) string {
 	v := url.Values{
-		"secret": []string{b32.EncodeToString(totp.Secret)},
+		"secret": []string{b32.EncodeToString(k.secret)},
 		"issuer": []string{issuer},
 	}
-	if totp.Algorithm != "sha1" {
-		v.Set("algorithm", totp.Algorithm)
+	if k.algorithm != "sha1" {
+		v.Set("algorithm", k.algorithm)
 	}
-	if totp.Digits != 6 {
-		v.Set("digits", strconv.Itoa(totp.Digits))
+	if k.digits != 6 {
+		v.Set("digits", strconv.Itoa(k.digits))
 	}
-	if totp.Period != 30 {
-		v.Set("period", strconv.Itoa(totp.Period))
+	if k.period != 30 {
+		v.Set("period", strconv.Itoa(k.period))
 	}
 
 	u := url.URL{
@@ -176,6 +201,45 @@ func (totp *TOTP) URI(issuer, account string) string {
 	}
 
 	return u.String()
+}
+
+// ToEncryptedString converts key to encrypted string
+func (k *Key) ToEncryptedString(encrypter Encrypter) (string, error) {
+	tmp := key{
+		Algorithm: k.algorithm,
+		Digits:    k.digits,
+		Period:    k.period,
+		Secret:    k.secret,
+	}
+	raw, err := json.Marshal(&tmp)
+	if err != nil {
+		return "", err
+	}
+	encrypted, err := encrypter.Encrypt(raw)
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(encrypted), nil
+}
+
+// FromEncryptedString decrypts and returns key
+func FromEncryptedString(encryptedStr string, decrypter Decrypter) (*Key, error) {
+	encrypted, err := base64.URLEncoding.DecodeString(encryptedStr)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := decrypter.Decrypt(encrypted)
+	if err != nil {
+		return nil, err
+	}
+
+	tmp := key{}
+	err = json.Unmarshal(raw, &tmp)
+	if err != nil {
+		return nil, err
+	}
+
+	return NewKey(Algorithm(tmp.Algorithm), Digits(tmp.Digits), Period(tmp.Period), Secret(tmp.Secret))
 }
 
 func truncatedStringCode(code, digits int) string {
